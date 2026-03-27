@@ -86,13 +86,18 @@ class DriveDirectCopier:
             r"/folders/([a-zA-Z0-9_-]+)",
             r"/file/d/([a-zA-Z0-9_-]+)",
             r"id=([a-zA-Z0-9_-]+)",
+            r"/u/\d+/folders/([a-zA-Z0-9_-]+)", # Added for /u/X/ patterns
+            r"/u/\d+/file/d/([a-zA-Z0-9_-]+)",   # Added for /u/X/ patterns
         ]
         for p in patterns:
             m = re.search(p, text)
             if m:
                 return m.group(1)
-        if re.match(r"^[a-zA-Z0-9_-]+$", text):
-            return text
+        
+        # If it's just a raw ID, strip and return
+        clean_text = text.strip()
+        if re.match(r"^[a-zA-Z0-9_-]+$", clean_text):
+            return clean_text
         return None
 
     def _execute_with_retry(self, request, max_retries=5):
@@ -181,7 +186,7 @@ class DriveDirectCopier:
             "parents": [parent_id],
         }
         try:
-            request = service.files().create(body=file_metadata, fields="id")
+            request = service.files().create(body=file_metadata, fields="id", supportsAllDrives=True)
             folder = self._execute_with_retry(request)
             return folder.get("id") if folder else None
         except Exception as e:
@@ -305,6 +310,34 @@ class DriveDirectCopier:
             self._log_error(msg)
             return False
 
+    def verify_folder_access(self, folder_id: str):
+        """Checks if the given folder ID exists and is accessible."""
+        service = self._get_api_service()
+        try:
+            print(f"Verifying access to ID: {folder_id}...")
+            res = service.files().get(
+                fileId=folder_id, 
+                fields="id, name, capabilities(canAddChildren)", 
+                supportsAllDrives=True
+            ).execute()
+            print(f"✅ Found: '{res.get('name')}'")
+            if not res.get('capabilities', {}).get('canAddChildren'):
+                print(f"⚠️ Warning: You may not have 'Editor' permissions on this folder.")
+            return True
+        except Exception as e:
+            print(f"❌ Error accessing folder: {e}")
+            return False
+
+    def copy_single_folder_manual(self, src_folder_id: str, dest_parent_id: str):
+        """Helper to quickly copy a single folder manually without Excel."""
+        service = self._get_api_service()
+        print(f"\n--- 🚀 STARTING MANUAL FOLDER COPY ---")
+        success = self.copy_recursive(service, src_folder_id, dest_parent_id)
+        if success:
+            print(f"\n✅ FOLDER COPY COMPLETED!")
+        else:
+            print(f"\n❌ FOLDER COPY FAILED. Check logs or ID.")
+
     def run(self, excel_file, target_folder_id):
         """Main runner that reads Excel data and dispatches worker threads."""
         if not os.path.exists(excel_file):
@@ -371,7 +404,7 @@ class DriveDirectCopier:
         # Dispatch worker pool
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             tasks = [
-                executor.submit(self.process_row, i, row, final_link_col, final_id_col, final_name_col, target_folder_id, total)
+                executor.submit(self.process_row, i, row, final_link_col, final_id_col, final_name_col, target_folder_id, total)  # type: ignore
                 for i, row in df.iterrows()
             ]
             for future in concurrent.futures.as_completed(tasks):
@@ -395,25 +428,65 @@ class DriveDirectCopier:
                     print(f"  [ERROR] Cleanup failed: {e}")
 
 if __name__ == "__main__":
-    print("--- GOOGLE DRIVE MULTI-WORKER SYNC ---")
+    print("==============================================")
+    print("   🤖 GOOGLE DRIVE MULTI-WORKER SYNC TOOL     ")
+    print("==============================================")
 
-    while True:
-        target_id = input("Enter your DESTINATION Folder ID: ").strip()
-        if target_id: break
-        print("Error: Destination Folder ID is required.")
-
-    while True:
-        try:
-            workers = int(input("Enter number of workers: ").strip())
-            if workers > 0: break
-            print("Error: Number of workers must be a positive integer.")
-        except ValueError:
-            print("Error: Please enter a valid number.")
-
+    # Load environment variables for Excel path
     excel_file = os.getenv("EXCEL_DATA_FILE")
-    if not excel_file:
-        print("Error: EXCEL_DATA_FILE not defined in .env")
-        sys.exit(1)
+    
+    print("\nCHOOSE MODE:")
+    print("1. Sync from Excel file (Multi-workers)")
+    print("2. Copy 1 Single Folder (Manual Copy)")
+    
+    choice = input("\nEnter your choice (1/2): ").strip()
 
-    copier = DriveDirectCopier(max_workers=workers)
-    copier.run(excel_file, target_id)
+    if choice == "1":
+        # MODE 1: EXCEL SYNC
+        if not excel_file:
+            print("Error: EXCEL_DATA_FILE not defined in .env")
+            sys.exit(1)
+
+        target_id = input("➡️ Enter DESTINATION Folder ID: ").strip()
+        while not target_id:
+            target_id = input("Error: Destination ID is required: ").strip()
+
+        try:
+            workers_input = input("➡️ Enter number of workers (default 5): ").strip()
+            workers = int(workers_input) if workers_input else 5
+        except ValueError:
+            workers = 5
+
+        copier = DriveDirectCopier(max_workers=workers)
+        copier.run(excel_file, target_id)
+
+    elif choice == "2":
+        # MODE 2: MANUAL SINGLE FOLDER COPY
+        src_input = input("➡️ Enter SOURCE Folder Link or ID: ").strip()
+        dest_input = input("➡️ Enter DESTINATION Folder Link or ID: ").strip()
+
+        try:
+            workers_input = input("➡️ Enter number of workers (default 5): ").strip()
+            workers = int(workers_input) if workers_input else 5
+        except ValueError:
+            workers = 5
+        
+        copier = DriveDirectCopier(max_workers=workers)
+        src_id = copier._extract_id(src_input)
+        dest_id = copier._extract_id(dest_input)
+
+        if not src_id or not dest_id:
+            print("Error: Could not extract valid IDs from your input.")
+            sys.exit(1)
+
+        # Pre-verification
+        print("\nChecking permissions...")
+        if not copier.verify_folder_access(str(dest_id)):
+            print("Aborting because destination is not reachable.")
+            sys.exit(1)
+
+        # Start manual copy
+        copier.copy_single_folder_manual(str(src_id), str(dest_id))
+
+    else:
+        print("Invalid choice. Exiting.")

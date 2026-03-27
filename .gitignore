@@ -56,6 +56,5 @@ dist
 
 # Credentials
 .env
-token.json
-client_secret*.json
+*.json
 downloaded_files/
